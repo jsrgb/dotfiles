@@ -2,6 +2,7 @@ local wezterm = require 'wezterm'
 local act = wezterm.action
 local mux = wezterm.mux
 local config = wezterm.config_builder()
+local workspace_colors_file = wezterm.home_dir .. '/.wezterm-workspace-colors.lua'
 local term_keys = {
   enable_kitty_keyboard = true,
   keys = {
@@ -215,24 +216,229 @@ local term_keys = {
   },
 }
 
+local workspace_colors = {
+  { id = 'red', label = 'Red', color = '#cc6666' },
+  { id = 'orange', label = 'Orange', color = '#de935f' },
+  { id = 'yellow', label = 'Yellow', color = '#f0c674' },
+  { id = 'green', label = 'Green', color = '#b5bd68' },
+  { id = 'cyan', label = 'Cyan', color = '#8abeb7' },
+  { id = 'blue', label = 'Blue', color = '#81a2be' },
+  { id = 'purple', label = 'Purple', color = '#b294bb' },
+}
+local workspace_menu_action_keys = 'scn'
+local workspace_menu_prefix_keys = '1234567890abdefghijklmopqrtuvwxyz'
+
+local function load_workspace_color_map()
+  local chunk = loadfile(workspace_colors_file)
+  if not chunk then
+    return {}
+  end
+
+  local ok, data = pcall(chunk)
+  if ok and type(data) == 'table' then
+    return data
+  end
+
+  return {}
+end
+
+local function normalize_workspace_colors(value)
+  if type(value) == 'string' then
+    return { value }
+  end
+
+  if type(value) ~= 'table' then
+    return {}
+  end
+
+  local colors = {}
+  local seen = {}
+  for _, color_id in ipairs(value) do
+    if type(color_id) == 'string' and not seen[color_id] then
+      table.insert(colors, color_id)
+      seen[color_id] = true
+    end
+  end
+
+  return colors
+end
+
+local function save_workspace_color_map(color_map)
+  local file = io.open(workspace_colors_file, 'w')
+  if not file then
+    return
+  end
+
+  file:write('return {\n')
+  for name, color_ids in pairs(color_map) do
+    file:write('  [', string.format('%q', name), '] = { ')
+    for _, color_id in ipairs(normalize_workspace_colors(color_ids)) do
+      file:write(string.format('%q', color_id), ', ')
+    end
+    file:write('},\n')
+  end
+  file:write('}\n')
+  file:close()
+end
+
+local function workspace_color_value(color_id)
+  for _, entry in ipairs(workspace_colors) do
+    if entry.id == color_id then
+      return entry.color
+    end
+  end
+end
+
+local function workspace_label(name)
+  local color_ids = normalize_workspace_colors(load_workspace_color_map()[name])
+  if #color_ids == 0 then
+    return name
+  end
+
+  local formatted = {
+    { Text = name .. ' ' },
+  }
+
+  for _, color_id in ipairs(color_ids) do
+    local color = workspace_color_value(color_id)
+    if color then
+      table.insert(formatted, { Foreground = { Color = color } })
+      table.insert(formatted, { Text = '●' })
+      table.insert(formatted, 'ResetAttributes')
+    end
+  end
+
+  return wezterm.format(formatted)
+end
+
+local function set_workspace_color(name, color_id)
+  local color_map = load_workspace_color_map()
+  local colors = normalize_workspace_colors(color_map[name])
+  for _, existing in ipairs(colors) do
+    if existing == color_id then
+      save_workspace_color_map(color_map)
+      return
+    end
+  end
+
+  table.insert(colors, color_id)
+  color_map[name] = colors
+  save_workspace_color_map(color_map)
+end
+
+local function clear_workspace_color(name)
+  local color_map = load_workspace_color_map()
+  color_map[name] = nil
+  save_workspace_color_map(color_map)
+end
+
+local function rename_workspace_color(old_name, new_name)
+  local color_map = load_workspace_color_map()
+  if color_map[old_name] and old_name ~= new_name then
+    color_map[new_name] = normalize_workspace_colors(color_map[old_name])
+    color_map[old_name] = nil
+    save_workspace_color_map(color_map)
+  end
+end
+
+local function color_choices()
+  local choices = {}
+  for _, entry in ipairs(workspace_colors) do
+    table.insert(choices, {
+      id = '__set_color__' .. entry.id,
+      label = wezterm.format {
+        { Foreground = { Color = entry.color } },
+        { Text = '● ' .. entry.label },
+        'ResetAttributes',
+      },
+    })
+  end
+
+  return choices
+end
+
 local function workspace_choices()
   local names = mux.get_workspace_names()
-  table.sort(names)
 
   local choices = {}
   for _, name in ipairs(names) do
     table.insert(choices, {
       id = name,
-      label = name,
+      label = workspace_label(name),
     })
   end
 
+  table.insert(choices, {
+    id = '__set_current_workspace_color__',
+    label = 'Set color for current workspace',
+  })
+  table.insert(choices, {
+    id = '__clear_current_workspace_color__',
+    label = 'Clear color for current workspace',
+  })
   table.insert(choices, {
     id = '__create_new_workspace__',
     label = 'Create a new workspace',
   })
 
   return choices
+end
+
+local function workspace_menu_alphabet()
+  local workspace_count = #mux.get_workspace_names()
+  local prefix_length = math.min(workspace_count, #workspace_menu_prefix_keys)
+  return workspace_menu_prefix_keys:sub(1, prefix_length) .. workspace_menu_action_keys
+end
+
+local function handle_workspace_menu_action(inner_window, inner_pane, id)
+  if id == '__create_new_workspace__' then
+    inner_window:perform_action(
+      act.PromptInputLine {
+        description = 'New workspace name',
+        action = wezterm.action_callback(function(prompt_window, prompt_pane, line)
+          if line and line ~= '' then
+            prompt_window:perform_action(
+              act.SwitchToWorkspace { name = line },
+              prompt_pane
+            )
+          end
+        end),
+      },
+      inner_pane
+    )
+    return
+  end
+
+  if id == '__set_current_workspace_color__' then
+    inner_window:perform_action(
+      act.InputSelector {
+        title = 'Set workspace color',
+        choices = color_choices(),
+        fuzzy = false,
+        description = 'Select a color for the current workspace',
+        action = wezterm.action_callback(function(color_window, color_pane, color_id, color_label)
+          if color_id and color_id:match('^__set_color__') then
+            local selected = color_id:gsub('^__set_color__', '')
+            set_workspace_color(color_window:active_workspace(), selected)
+          end
+        end),
+      },
+      inner_pane
+    )
+    return
+  end
+
+  if id == '__clear_current_workspace_color__' then
+    clear_workspace_color(inner_window:active_workspace())
+    return
+  end
+
+  if id then
+    inner_window:perform_action(
+      act.SwitchToWorkspace { name = id },
+      inner_pane
+    )
+  end
 end
 
 -- Treat both Option keys as Alt/Meta in the terminal instead of macOS text composition
@@ -250,12 +456,31 @@ config.window_padding = {
 
 config.font_size = 16.0
 
--- config.color_scheme = 'Zenburn'
--- config.color_scheme = 'Nucolors (terminal.sexy)'
-config.color_scheme = 'Gruvbox dark, hard (base16)'
+config.color_scheme = 'Zenburn'
 
 wezterm.on('update-right-status', function(window, pane)
-  window:set_right_status('  ' .. window:active_workspace() .. '  ')
+  window:set_right_status('  ' .. workspace_label(window:active_workspace()) .. '  ')
+end)
+
+wezterm.on('new-tab-button-click', function(window, pane, button, default_action)
+  if button == 'Right' then
+    window:perform_action(
+      act.InputSelector {
+        title = 'Workspace menu',
+        choices = workspace_choices(),
+        fuzzy = false,
+        alphabet = workspace_menu_alphabet(),
+        description = 'Click a workspace to switch, or choose a workspace action',
+        action = wezterm.action_callback(function(inner_window, inner_pane, id, label)
+          handle_workspace_menu_action(inner_window, inner_pane, id)
+        end),
+      },
+      pane
+    )
+    return false
+  end
+
+  return default_action
 end)
 
 config.keys = {
@@ -268,29 +493,10 @@ config.keys = {
           title = 'Switch to workspace',
           choices = workspace_choices(),
           fuzzy = false,
+          alphabet = workspace_menu_alphabet(),
           description = 'Select a workspace, Enter = switch, / = filter, Esc = cancel',
           action = wezterm.action_callback(function(inner_window, inner_pane, id, label)
-            if id == '__create_new_workspace__' then
-              inner_window:perform_action(
-                act.PromptInputLine {
-                  description = 'New workspace name',
-                  action = wezterm.action_callback(function(prompt_window, prompt_pane, line)
-                    if line and line ~= '' then
-                      prompt_window:perform_action(
-                        act.SwitchToWorkspace { name = line },
-                        prompt_pane
-                      )
-                    end
-                  end),
-                },
-                inner_pane
-              )
-            elseif id then
-              inner_window:perform_action(
-                act.SwitchToWorkspace { name = id },
-                inner_pane
-              )
-            end
+            handle_workspace_menu_action(inner_window, inner_pane, id)
           end),
         },
         pane
@@ -320,6 +526,7 @@ config.keys = {
       description = 'Rename workspace to',
       action = wezterm.action_callback(function(window, pane, line)
         if line and line ~= '' then
+          rename_workspace_color(window:active_workspace(), line)
           mux.rename_workspace(window:active_workspace(), line)
         end
       end),
